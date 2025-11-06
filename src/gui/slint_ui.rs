@@ -30,7 +30,6 @@ slint::include_modules!();
 
 const DISPLAY_WIDTH: usize = 240;
 const DISPLAY_HEIGHT: usize = 240;
-
 thread_local! {
     static PLATFORM_WINDOW: RefCell<Option<Rc<MinimalSoftwareWindow>>> =
         const { RefCell::new(None) };
@@ -71,16 +70,22 @@ pub fn render_hello_world(display: &mut DisplayType<'static>) -> Result<()> {
 
     platform::update_timers_and_animations();
 
-    let mut line_buffer = [Rgb565Pixel(0); DISPLAY_WIDTH];
     let render_error = RefCell::<Option<anyhow::Error>>::new(None);
+    let display_ptr: *mut DisplayType<'static> = display;
+    let mut line_buffer = [Rgb565Pixel(0); DISPLAY_WIDTH];
 
     while window.draw_if_needed(|renderer| {
-        let provider = DisplayLineProvider {
-            display,
-            line_buffer: &mut line_buffer,
-            error: &render_error,
-        };
-        renderer.render_by_line(provider);
+        if render_error.borrow().is_some() {
+            return;
+        }
+
+        // Safety: the draw loop is single-threaded and guarantees no aliasing with other uses.
+        let display_ref = unsafe { &mut *display_ptr };
+        let mut provider = DisplayLineProvider::new(display_ref, &mut line_buffer, &render_error);
+        renderer.render_by_line(&mut provider);
+        if let Err(err) = provider.finish() {
+            *render_error.borrow_mut() = Some(err);
+        }
     }) {
         platform::update_timers_and_animations();
     }
@@ -98,13 +103,35 @@ pub fn render_hello_world(display: &mut DisplayType<'static>) -> Result<()> {
     Ok(())
 }
 
+const MAX_BATCH_LINES: usize = 16;
+
 struct DisplayLineProvider<'a, 'b> {
     display: &'a mut DisplayType<'static>,
     line_buffer: &'b mut [Rgb565Pixel; DISPLAY_WIDTH],
+    accumulator: LineAccumulator,
     error: &'b RefCell<Option<anyhow::Error>>,
 }
 
-impl LineBufferProvider for DisplayLineProvider<'_, '_> {
+impl<'a, 'b> DisplayLineProvider<'a, 'b> {
+    fn new(
+        display: &'a mut DisplayType<'static>,
+        line_buffer: &'b mut [Rgb565Pixel; DISPLAY_WIDTH],
+        error: &'b RefCell<Option<anyhow::Error>>,
+    ) -> Self {
+        Self {
+            display,
+            line_buffer,
+            accumulator: LineAccumulator::new(),
+            error,
+        }
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.accumulator.flush(self.display)
+    }
+}
+
+impl<'a, 'b, 'c> LineBufferProvider for &'c mut DisplayLineProvider<'a, 'b> {
     type TargetPixel = Rgb565Pixel;
 
     fn process_line(
@@ -120,17 +147,90 @@ impl LineBufferProvider for DisplayLineProvider<'_, '_> {
         let segment = &mut self.line_buffer[range.clone()];
         render_fn(segment);
 
+        if let Err(err) = self
+            .accumulator
+            .push_line(line, range, segment, self.display)
+        {
+            *self.error.borrow_mut() = Some(err);
+        }
+    }
+}
+
+struct LineAccumulator {
+    start_line: usize,
+    range: Range<usize>,
+    line_count: usize,
+    buffer: Vec<Rgb565Pixel>,
+}
+
+impl LineAccumulator {
+    fn new() -> Self {
+        Self {
+            start_line: 0,
+            range: 0..0,
+            line_count: 0,
+            buffer: Vec::with_capacity(DISPLAY_WIDTH * MAX_BATCH_LINES),
+        }
+    }
+
+    fn push_line(
+        &mut self,
+        line: usize,
+        range: Range<usize>,
+        pixels: &[Rgb565Pixel],
+        display: &mut DisplayType<'static>,
+    ) -> Result<()> {
+        if pixels.is_empty() {
+            return Ok(());
+        }
+
+        if self.line_count == 0 {
+            self.start_line = line;
+            self.range = range.clone();
+        } else {
+            let expected_line = self.start_line + self.line_count;
+            if line != expected_line
+                || range.start != self.range.start
+                || range.end != self.range.end
+            {
+                self.flush(display)?;
+                self.start_line = line;
+                self.range = range.clone();
+            }
+        }
+
+        self.buffer.extend_from_slice(pixels);
+        self.line_count += 1;
+
+        if self.line_count >= MAX_BATCH_LINES {
+            self.flush(display)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, display: &mut DisplayType<'static>) -> Result<()> {
+        if self.line_count == 0 {
+            return Ok(());
+        }
+
         let rect = Rectangle::new(
-            Point::new(range.start as i32, line as i32),
-            Size::new(range.len() as u32, 1),
+            Point::new(self.range.start as i32, self.start_line as i32),
+            Size::new(self.range.len() as u32, self.line_count as u32),
         );
 
-        if let Err(e) = self.display.fill_contiguous(
-            &rect,
-            segment.iter().map(|p| Rgb565::from(RawU16::new(p.0))),
-        ) {
-            *self.error.borrow_mut() = Some(anyhow!("Failed to refresh line {line}: {e:?}"));
-        }
+        let colors = self
+            .buffer
+            .iter()
+            .take(self.range.len() * self.line_count)
+            .map(|Rgb565Pixel(pixel)| Rgb565::from(RawU16::new(*pixel)));
+
+        display
+            .fill_contiguous(&rect, colors)
+            .map_err(|e| anyhow!("Failed to refresh region {:?}: {e:?}", rect))?;
+
+        self.buffer.clear();
+        self.line_count = 0;
+        Ok(())
     }
 }
 
