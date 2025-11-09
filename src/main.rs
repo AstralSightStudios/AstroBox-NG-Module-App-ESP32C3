@@ -1,8 +1,8 @@
 use esp_idf_svc::{
     hal::{gpio::Pins, prelude::Peripherals},
+    io::vfs::MountedEventfs,
     log::EspLogger,
     sys::link_patches,
-    io::vfs::MountedEventfs,
 };
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ fn main() -> anyhow::Result<()> {
 
     let _mounted_eventfs = MountedEventfs::mount(5)?;
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
 

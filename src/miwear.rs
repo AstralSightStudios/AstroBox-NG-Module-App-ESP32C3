@@ -1,11 +1,11 @@
 use corelib::device::{
     self,
-    xiaomi::{SendError, r#type::ConnectType},
+    xiaomi::{r#type::ConnectType, SendError},
 };
-use esp32_nimble::{BLEDevice, BLEScan, utilities::BleUuid, utilities::BleUuid::Uuid16};
+use esp32_nimble::{utilities::BleUuid, utilities::BleUuid::Uuid16, BLEDevice, BLEScan};
 use log::info;
-use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 pub mod ancs;
 
@@ -53,6 +53,21 @@ pub async fn connect() -> anyhow::Result<()> {
 
     let mut client: esp32_nimble::BLEClient = ble.new_client();
     client.set_connection_params(12, 24, 0, 400, 16, 16);
+
+    let disconnect_notify = Arc::new(Notify::new());
+    let disconnect_reason = Arc::new(Mutex::new(None));
+    client.on_disconnect({
+        let disconnect_notify = Arc::clone(&disconnect_notify);
+        let disconnect_reason = Arc::clone(&disconnect_reason);
+        move |reason| {
+            log::warn!("BLE disconnected (reason: {})", reason);
+            if let Ok(mut slot) = disconnect_reason.lock() {
+                *slot = Some(reason);
+            }
+            disconnect_notify.notify_waiters();
+        }
+    });
+
     info!("Connecting...");
     client.connect(&addr).await?;
     info!("Connected = {}", client.connected());
@@ -112,7 +127,7 @@ pub async fn connect() -> anyhow::Result<()> {
         }
     }
 
-    let (tx, mut rx) =
+    let (send_tx, mut rx) =
         mpsc::unbounded_channel::<(Vec<u8>, oneshot::Sender<Result<(), SendError>>)>();
     let mut ch_sent_worker = ch_sent;
     let _send_task = tokio::task::spawn_local(async move {
@@ -138,9 +153,9 @@ pub async fn connect() -> anyhow::Result<()> {
         }
     });
 
-    let tx = Arc::new(tx);
+    let send_queue = Arc::new(send_tx);
     let send_cb = {
-        let tx = Arc::clone(&tx);
+        let tx = Arc::clone(&send_queue);
         move |data: Vec<u8>| {
             let tx = Arc::clone(&tx);
             async move {
@@ -196,6 +211,14 @@ pub async fn connect() -> anyhow::Result<()> {
         },
     )
     .await?;
+
+    info!("MiWear session ready, waiting for disconnect...");
+    disconnect_notify.notified().await;
+    let reason = match disconnect_reason.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => None,
+    };
+    info!("Disconnected from {} (reason: {:?})", device_addr, reason);
 
     Ok(())
 }
