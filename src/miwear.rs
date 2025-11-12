@@ -1,13 +1,32 @@
-use corelib::device::{
-    self,
-    xiaomi::{r#type::ConnectType, SendError},
+use corelib::{
+    device::{
+        self,
+        xiaomi::{
+            components::{
+                resource::{ResourceComponent, ResourceSystem},
+                thirdparty_app::{AppInfo, ThirdpartyAppComponent, ThirdpartyAppSystem},
+            },
+            r#type::ConnectType,
+            SendError, XiaomiDevice,
+        },
+    },
+    ecs::{entity::EntityExt, logic_component::LogicComponent},
 };
 use esp32_nimble::{utilities::BleUuid, utilities::BleUuid::Uuid16, BLEDevice, BLEScan};
 use log::info;
-use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot, Notify};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{
+    sync::{mpsc, oneshot, Notify},
+    time,
+};
 
 pub mod ancs;
+
+const AUTO_LAUNCH_PACKAGE: &str = "com.searchstars.hyperbilibili";
+const AUTO_LAUNCH_DELAY_SECS: u64 = 10;
 
 fn u16_uuid(u: u16) -> BleUuid {
     BleUuid::from(Uuid16(u))
@@ -178,7 +197,7 @@ pub async fn connect() -> anyhow::Result<()> {
         let notify_handle = handle.clone();
         let notify_addr = device_addr.clone();
         ch_recv.on_notify(move |payload| {
-            log::info!("Notify(0x005E): {}", corelib::tools::to_hex_string(payload));
+            //log::info!("Notify(0x005E): {}", corelib::tools::to_hex_string(payload));
             corelib::device::xiaomi::packet::dispatcher::on_packet(
                 notify_handle.clone(),
                 notify_addr.clone(),
@@ -200,7 +219,7 @@ pub async fn connect() -> anyhow::Result<()> {
         ConnectType::BLE,
         false,
         move |data| {
-            log::info!("Write(0x005F): {}", corelib::tools::to_hex_string(&data));
+            //log::info!("Write(0x005F): {}", corelib::tools::to_hex_string(&data));
             let fut = send_cb(data);
             async move {
                 fut.await.map_err(|err| {
@@ -212,6 +231,27 @@ pub async fn connect() -> anyhow::Result<()> {
     )
     .await?;
 
+    {
+        let addr_for_launch = device_addr.clone();
+        tokio::task::spawn_local(async move {
+            time::sleep(Duration::from_secs(AUTO_LAUNCH_DELAY_SECS)).await;
+            match launch_watch_app(&addr_for_launch, AUTO_LAUNCH_PACKAGE).await {
+                Ok(_) => log::info!(
+                    "Auto launched {} on {}",
+                    AUTO_LAUNCH_PACKAGE,
+                    addr_for_launch
+                ),
+                Err(err) => {
+                    log::warn!(
+                        "Failed to auto launch {} on {}: {err:?}",
+                        AUTO_LAUNCH_PACKAGE,
+                        addr_for_launch
+                    );
+                }
+            }
+        });
+    }
+
     info!("MiWear session ready, waiting for disconnect...");
     disconnect_notify.notified().await;
     let reason = match disconnect_reason.lock() {
@@ -220,5 +260,86 @@ pub async fn connect() -> anyhow::Result<()> {
     };
     info!("Disconnected from {} (reason: {:?})", device_addr, reason);
 
+    Ok(())
+}
+
+async fn launch_watch_app(addr: &str, package: &str) -> anyhow::Result<()> {
+    let app_info = resolve_app_info(addr, package).await?;
+    let addr_owned = addr.to_string();
+    let info = app_info.clone();
+    corelib::ecs::with_rt_mut(move |rt| {
+        let dev = rt
+            .find_entity_by_id_mut::<XiaomiDevice>(&addr_owned)
+            .ok_or_else(|| anyhow::anyhow!("device {} not found", addr_owned))?;
+        let component = dev
+            .get_component_as_mut::<ThirdpartyAppComponent>(ThirdpartyAppComponent::ID)
+            .map_err(|err| anyhow::anyhow!("third-party component unavailable: {:?}", err))?;
+        let system = component
+            .system_mut()
+            .as_any_mut()
+            .downcast_mut::<ThirdpartyAppSystem>()
+            .ok_or_else(|| anyhow::anyhow!("third-party system missing"))?;
+        system.launch_app(&info, "");
+        Ok(())
+    })
+    .await
+}
+
+async fn resolve_app_info(addr: &str, package: &str) -> anyhow::Result<AppInfo> {
+    if let Some(info) = lookup_cached_app_info(addr, package).await? {
+        return Ok(info);
+    }
+
+    refresh_quick_app_list(addr).await?;
+
+    lookup_cached_app_info(addr, package)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("package {} not installed on {}", package, addr))
+}
+
+async fn lookup_cached_app_info(addr: &str, package: &str) -> anyhow::Result<Option<AppInfo>> {
+    let addr_owned = addr.to_string();
+    let package_owned = package.to_string();
+    corelib::ecs::with_rt_mut(move |rt| {
+        let dev = rt
+            .find_entity_by_id_mut::<XiaomiDevice>(&addr_owned)
+            .ok_or_else(|| anyhow::anyhow!("device {} not found", addr_owned))?;
+        let component = match dev.get_component_as_mut::<ResourceComponent>(ResourceComponent::ID) {
+            Ok(comp) => comp,
+            Err(_) => return Ok(None),
+        };
+        let info = component
+            .quick_apps
+            .iter()
+            .find(|item| item.package_name == package_owned)
+            .map(|item| AppInfo {
+                package_name: item.package_name.clone(),
+                fingerprint: item.fingerprint.clone(),
+            });
+        Ok(info)
+    })
+    .await
+}
+
+async fn refresh_quick_app_list(addr: &str) -> anyhow::Result<()> {
+    let addr_owned = addr.to_string();
+    let rx = corelib::ecs::with_rt_mut(move |rt| {
+        let dev = rt
+            .find_entity_by_id_mut::<XiaomiDevice>(&addr_owned)
+            .ok_or_else(|| anyhow::anyhow!("device {} not found", addr_owned))?;
+        let component = dev
+            .get_component_as_mut::<ResourceComponent>(ResourceComponent::ID)
+            .map_err(|err| anyhow::anyhow!("resource component unavailable: {:?}", err))?;
+        let system = component
+            .system_mut()
+            .as_any_mut()
+            .downcast_mut::<ResourceSystem>()
+            .ok_or_else(|| anyhow::anyhow!("resource system missing"))?;
+        Ok::<_, anyhow::Error>(system.request_quick_app_list())
+    })
+    .await?;
+
+    rx.await
+        .map_err(|err| anyhow::anyhow!("quick app response dropped: {err:?}"))??;
     Ok(())
 }
