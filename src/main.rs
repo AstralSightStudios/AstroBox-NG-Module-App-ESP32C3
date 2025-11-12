@@ -1,6 +1,10 @@
 use core::convert::TryInto;
 
 use anyhow::anyhow;
+use corelib::{
+    device::xiaomi::{components::network::NetworkComponent, XiaomiDevice},
+    ecs::entity::EntityExt,
+};
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     hal::{gpio::Pins, modem::Modem, prelude::Peripherals},
@@ -55,10 +59,11 @@ async fn run_app() -> anyhow::Result<()> {
 
     corelib::ecs::init_runtime_default_with_stack(ECS_STACK_SIZE);
     tokio::task::spawn_local(async {
-        let mut ticker = tokio::time::interval(Duration::from_secs(10));
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
         loop {
             ticker.tick().await;
             statlogger::log_heap_info();
+            log_network_meter().await;
         }
     });
 
@@ -123,6 +128,38 @@ async fn run_app() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+async fn log_network_meter() {
+    let speeds = corelib::ecs::with_rt_mut(|rt| {
+        rt.entities
+            .values_mut()
+            .filter_map(|entity| {
+                let dev = entity.as_any_mut().downcast_mut::<XiaomiDevice>()?;
+                let name = dev.name.clone();
+                let addr = dev.addr.clone();
+                let speed = dev
+                    .get_component_as_mut::<NetworkComponent>(NetworkComponent::ID)
+                    .ok()
+                    .map(|comp| comp.last_speed)?;
+                Some((name, addr, speed))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await;
+
+    if speeds.is_empty() {
+        log::info!("NET meter: no connected devices");
+        return;
+    }
+
+    for (name, addr, speed) in speeds {
+        log::info!(
+            "NET meter {name}({addr}) ↑{:.1} KB/s ↓{:.1} KB/s",
+            speed.write / 1024.0,
+            speed.read / 1024.0
+        );
+    }
 }
 
 fn init_wifi(modem: Modem) -> anyhow::Result<BlockingWifi<EspWifi<'static>>> {
