@@ -2,7 +2,7 @@ use core::convert::TryInto;
 
 use anyhow::anyhow;
 use corelib::{
-    device::xiaomi::{components::network::NetworkComponent, XiaomiDevice},
+    device::xiaomi::{XiaomiDevice, components::network::NetworkComponent},
     ecs::entity::EntityExt,
 };
 use esp_idf_svc::{
@@ -136,8 +136,8 @@ async fn log_network_meter() {
             .values_mut()
             .filter_map(|entity| {
                 let dev = entity.as_any_mut().downcast_mut::<XiaomiDevice>()?;
-                let name = dev.name.clone();
-                let addr = dev.addr.clone();
+                let name = dev.name().to_string();
+                let addr = dev.addr().to_string();
                 let speed = dev
                     .get_component_as_mut::<NetworkComponent>(NetworkComponent::ID)
                     .ok()
